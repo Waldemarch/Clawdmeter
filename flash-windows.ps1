@@ -11,6 +11,10 @@ param(
     [string]$Port
 )
 
+# esptool uses Unicode progress chars (▓░) that break on CP1250 terminals
+chcp 65001 | Out-Null
+$env:PYTHONUTF8 = "1"
+
 $PIO = "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $FirmwareDir = Join-Path $ScriptDir "firmware"
