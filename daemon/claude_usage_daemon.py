@@ -31,22 +31,17 @@ TICK = 5
 SCAN_TIMEOUT = 8.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
-# Linux: token lives in ~/.claude/.credentials.json.
+# Linux/Windows: token lives in ~/.claude/.credentials.json.
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
 
-API_URL = "https://api.anthropic.com/v1/messages"
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 API_HEADERS_TEMPLATE = {
     "anthropic-version": "2023-06-01",
     "anthropic-beta": "oauth-2025-04-20",
-    "Content-Type": "application/json",
     "User-Agent": "claude-code/2.1.5",
-}
-API_BODY = {
-    "model": "claude-haiku-4-5-20251001",
-    "max_tokens": 1,
-    "messages": [{"role": "user", "content": "hi"}],
 }
 
 
@@ -86,6 +81,58 @@ def _extract_access_token(blob: str) -> str | None:
     return None
 
 
+def _is_token_expired(credentials: dict) -> bool:
+    oauth = credentials.get("claudeAiOauth", {})
+    expires_at = oauth.get("expiresAt")
+    if not expires_at:
+        return False
+    # expiresAt is in milliseconds; 60s buffer before actual expiry
+    return (time.time() * 1000) > (expires_at - 60_000)
+
+
+def _find_claude_cli() -> str | None:
+    candidates = [
+        Path.home() / ".local" / "bin" / "claude.exe",
+        Path.home() / ".local" / "bin" / "claude",
+        Path("claude.exe"),
+        Path("claude"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    # fall back to PATH
+    import shutil
+    return shutil.which("claude")
+
+
+def _refresh_token_via_cli() -> bool:
+    """Run `claude doctor` to trigger the CLI's built-in token refresh.
+
+    `claude --version` and `claude auth status` do NOT refresh the token.
+    `claude doctor` makes a health-check API call that causes the CLI to
+    detect the expired token and use refresh_token to obtain a new one.
+    """
+    cli = _find_claude_cli()
+    if not cli:
+        log("claude CLI not found; cannot auto-refresh token")
+        return False
+    log(f"Token expired — refreshing via '{cli} doctor' ...")
+    try:
+        result = subprocess.run(
+            [cli, "doctor"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "NO_COLOR": "1"},
+        )
+        log(f"claude doctor exit={result.returncode}")
+        # Check if credentials file was actually updated
+        return True
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"Token refresh via claude doctor failed: {e}")
+        return False
+
+
 def _read_token_keychain() -> str | None:
     try:
         out = subprocess.run(
@@ -118,6 +165,19 @@ def _read_token_file() -> str | None:
     except OSError as e:
         log(f"Error reading credentials: {e}")
         return None
+    try:
+        credentials = json.loads(raw)
+    except json.JSONDecodeError:
+        return _extract_access_token(raw)
+    if _is_token_expired(credentials):
+        if _refresh_token_via_cli():
+            # Re-read the file — claude CLI updated it
+            try:
+                raw = CREDENTIALS_PATH.read_text()
+            except OSError:
+                pass
+        else:
+            log("Token refresh failed, trying existing token anyway")
     return _extract_access_token(raw)
 
 
@@ -157,46 +217,63 @@ async def scan_for_device() -> str | None:
     return None
 
 
-async def poll_api(token: str) -> dict | None:
+def _resets_at_to_minutes(resets_at: str) -> int:
+    """Convert an ISO-8601 reset timestamp to minutes from now."""
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(resets_at)
+        now = datetime.now(timezone.utc)
+        secs = (dt - now).total_seconds()
+        return max(0, int(round(secs / 60)))
+    except (ValueError, TypeError):
+        return 0
+
+
+async def fetch_usage(token: str) -> dict | None:
+    """Fetch usage data from /api/oauth/usage.
+
+    Returns a payload dict ready to send to the device, or None on error.
+    """
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
     try:
         async with httpx.AsyncClient(timeout=20.0) as http:
-            resp = await http.post(API_URL, headers=headers, json=API_BODY)
+            resp = await http.get(USAGE_URL, headers=headers)
     except httpx.HTTPError as e:
-        log(f"API call failed: {e}")
+        log(f"Usage API call failed: {e}")
         return None
     if resp.status_code >= 400:
-        log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
+        log(f"Usage API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
 
-    def hdr(name: str, default: str = "0") -> str:
-        return resp.headers.get(name, default)
+    try:
+        data = resp.json()
+    except Exception as e:
+        log(f"Usage API JSON parse error: {e}")
+        return None
 
-    now = time.time()
+    five_hour = data.get("five_hour") or {}
+    utilization = five_hour.get("utilization", 0.0) or 0.0
+    resets_at = five_hour.get("resets_at", "")
+    s_pct = min(int(round(utilization)), 150)  # cap at 150 to fit int display
+    s_reset = _resets_at_to_minutes(resets_at)
+    st = "limited" if utilization >= 100.0 else "allowed"
 
-    def reset_minutes(reset_ts: str) -> int:
-        try:
-            r = float(reset_ts)
-        except ValueError:
-            return 0
-        mins = (r - now) / 60.0
-        return int(round(mins)) if mins > 0 else 0
-
-    def pct(util: str) -> int:
-        try:
-            return int(round(float(util) * 100))
-        except ValueError:
-            return 0
+    extra = data.get("extra_usage") or {}
+    cu = int(extra.get("used_credits", 0) or 0)
+    cl = int(extra.get("monthly_limit", 0) or 0)
+    cc = extra.get("currency", "USD") or "USD"
 
     payload = {
-        "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-        "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-        "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
-        "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
-        "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
+        "s": s_pct,
+        "sr": s_reset,
+        "cu": cu,
+        "cl": cl,
+        "cc": cc,
+        "st": st,
         "ok": True,
     }
+    log(f"Usage: 5h={s_pct}% (resets {s_reset}m), credits={cu}/{cl} {cc}")
     return payload
 
 
@@ -261,7 +338,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                 if not token:
                     log("No token; skipping poll")
                 else:
-                    payload = await poll_api(token)
+                    payload = await fetch_usage(token)
                     if payload is not None:
                         if await session.write_payload(payload):
                             last_poll = time.time()
