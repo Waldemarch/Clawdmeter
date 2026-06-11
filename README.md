@@ -10,6 +10,13 @@ Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 | :-----------------------------------: | :----------------------------------------------: |
 | ![Usage meter](assets/demo.jpeg) | ![Clawd animation screen](assets/demo.gif) |
 
+### ESP32-C6 build — monthly credit usage display
+
+|                                                                 |                                                                    |
+| :-------------------------------------------------------------: | :----------------------------------------------------------------: |
+| ![Device close-up](photos-06-2026/MVIMG_20260611_201856.jpg)   | ![Device in context](photos-06-2026/MVIMG_20260611_201833.jpg)    |
+| ESP32-C6 showing 5h utilization + monthly EUR credits           | Live on desk while finding the `/api/oauth/usage` endpoint         |
+
 The Clawd animations come from [claudepix](https://claudepix.vercel.app), [@amaanbuilds](https://x.com/amaanbuilds)'s library of pixel-art Clawd sprites, check it out, it's lovely.
 
 ## Screens
@@ -19,7 +26,7 @@ The device boots into the splash. Tap the screen anywhere to switch to the Usage
 |              Splash               |              Usage              |
 | :-------------------------------: | :-----------------------------: |
 | ![Splash](screenshots/splash.png) | ![Usage](screenshots/usage.png) |
-|   Splash; touch-toggle anytime    | Session and weekly utilization  |
+|   Splash; touch-toggle anytime    | Session utilization + monthly credits |
 
 While the splash is up, the middle (PWR) button cycles animations. **Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
 
@@ -41,7 +48,7 @@ Boards supported out of the box:
 - [PlatformIO CLI](https://docs.platformio.org/en/latest/core/installation/index.html)
 - Linux: `curl`, `bluetoothctl`, `busctl` (BlueZ Bluetooth stack)
 - macOS: `python3` (the installer sets up a venv with `bleak` and `httpx`)
-- Windows: `python3` 3.11+ (the installer sets up a venv with `bleak`, `httpx`, and `pystray`)
+- Windows: `python3` 3.11+, PowerShell 5.1+ (the installer sets up a venv with `bleak`, `httpx`, and `pystray`)
 - Claude Code with an active subscription
 
 ## macOS installation
@@ -79,6 +86,50 @@ tail -F ~/Library/Logs/claude-usage-daemon.out.log                          # li
 launchctl unload ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist  # stop
 launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist # start
 ```
+
+## Windows installation
+
+### Prerequisites
+
+Install Python 3.10+ from [python.org](https://www.python.org/downloads/) and PlatformIO CLI. Then create the Python venv once:
+
+```powershell
+cd daemon
+python -m venv .venv
+.venv\Scripts\pip install bleak httpx
+```
+
+### Flash the firmware
+
+```powershell
+.\flash-windows.ps1 waveshare_amoled_216_c6   # auto-detects the USB serial port
+.\flash-windows.ps1 waveshare_amoled_216_c6 COM14   # or pass an explicit port
+```
+
+Run `.\flash-windows.ps1` with no args to list available board envs.
+
+### Pair the device
+
+Open **Settings → Bluetooth & devices**, click *Add device → Bluetooth*, and pair "Claude Controller". Windows will also register it as a BLE HID keyboard — this is expected.
+
+### Start the daemon
+
+```powershell
+.\start-daemon.ps1
+```
+
+The daemon reads your Claude OAuth token from `%USERPROFILE%\.claude\.credentials.json`, polls usage every 60 s, and pushes it to the display over BLE. It auto-refreshes the token via `claude doctor` when it expires (~12 h).
+
+To keep the daemon running in the background, create a Scheduled Task:
+
+```powershell
+$action = New-ScheduledTaskAction -Execute "powershell.exe" `
+  -Argument "-WindowStyle Hidden -File C:\path\to\ClawdMeter\start-daemon.ps1"
+$trigger = New-ScheduledTaskTrigger -AtLogon
+Register-ScheduledTask -TaskName "ClawdMeter-Daemon" -Action $action -Trigger $trigger -RunLevel Highest
+```
+
+For token auto-refresh add a second task that runs `claude doctor` every 10 hours.
 
 ## Linux installation
 
@@ -185,9 +236,9 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 
 ## How it works
 
-1. The daemon reads your Claude Code OAuth token — from the macOS Keychain (service `Claude Code-credentials`) on macOS, or from `~/.claude/.credentials.json` on Linux (`%USERPROFILE%\.claude\.credentials.json` on Windows).
-2. It makes a minimal API call to `api.anthropic.com/v1/messages` — one token of Haiku, basically free.
-3. The usage numbers come straight out of the response headers (`anthropic-ratelimit-unified-5h-utilization` and friends).
+1. The daemon reads your Claude Code OAuth token — from the macOS Keychain (service `Claude Code-credentials`) on macOS, or from `~/.claude/.credentials.json` on Linux/Windows (`%USERPROFILE%\.claude\.credentials.json`). On Windows it also auto-refreshes the token via `claude doctor` when it expires (~12 h).
+2. It calls `GET api.anthropic.com/api/oauth/usage` — no tokens consumed, no cost.
+3. The response gives the 5-hour utilization, next reset timestamp, and `extra_usage` with monthly credits used/limit/currency (e.g. `used_credits: 3554` = €35.54 of €150.00).
 4. The daemon connects to the ESP32 over BLE and writes a JSON payload to the GATT RX characteristic.
 5. The firmware parses it and updates the LVGL dashboard.
 6. The firmware also tracks the rate of change of session % over a 5-minute window and picks splash animations from the matching mood group.
@@ -219,10 +270,10 @@ The device advertises a custom GATT service alongside the standard HID keyboard 
 JSON payload format (written to RX):
 
 ```json
-{ "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "ok": true }
+{ "s": 45, "sr": 120, "cu": 3554, "cl": 15000, "cc": "EUR", "st": "allowed", "ok": true }
 ```
 
-Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
+Fields: `s` = 5-hour utilization %, `sr` = minutes until session resets, `cu` = monthly credits used (in currency cents, e.g. 3554 = €35.54), `cl` = monthly credits limit (cents), `cc` = currency code (`"EUR"` or `"USD"`), `st` = status (`"allowed"` or `"limited"`), `ok` = success flag.
 
 ## Recompiling fonts
 
