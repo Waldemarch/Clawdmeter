@@ -10,18 +10,25 @@ Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
 | :-----------------------------------: | :----------------------------------------------: |
 | ![Usage meter](assets/demo.jpeg) | ![Clawd animation screen](assets/demo.gif) |
 
+### ESP32-C6 build — monthly credit usage display
+
+|                                                                 |                                                                    |
+| :-------------------------------------------------------------: | :----------------------------------------------------------------: |
+| ![Device close-up](photos-06-2026/MVIMG_20260611_201856.jpg)   | ![Device in context](photos-06-2026/MVIMG_20260611_201833.jpg)    |
+| ESP32-C6 showing 5h utilization + monthly EUR credits           | Live on desk while finding the `/api/oauth/usage` endpoint         |
+
 The Clawd animations come from [claudepix](https://claudepix.vercel.app), [@amaanbuilds](https://x.com/amaanbuilds)'s library of pixel-art Clawd sprites, check it out, it's lovely.
 
 ## Screens
 
-The device boots into the splash and stays there until you press the middle (PWR) button, which cycles between Usage and Bluetooth. Tap the screen anywhere (except the Reset zone on the Bluetooth screen) to flip back to the splash; tap again to dismiss it.
+The device boots into the splash. Tap the screen anywhere to switch to the Usage view; tap again to flip back to the splash.
 
-|              Splash               |              Usage              |                Bluetooth                |
-| :-------------------------------: | :-----------------------------: | :-------------------------------------: |
-| ![Splash](screenshots/splash.png) | ![Usage](screenshots/usage.png) | ![Bluetooth](screenshots/bluetooth.png) |
-|   Splash; touch-toggle anytime    | Session utilization + monthly credits | Connection status and bond reset |
+|              Splash               |              Usage              |
+| :-------------------------------: | :-----------------------------: |
+| ![Splash](screenshots/splash.png) | ![Usage](screenshots/usage.png) |
+|   Splash; touch-toggle anytime    | Session utilization + monthly credits |
 
-While the splash is up, the middle button cycles animations instead of screens. The firmware also auto-rotates every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
+While the splash is up, the middle (PWR) button cycles animations. **Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
 
 ## Hardware
 
@@ -41,7 +48,7 @@ Boards supported out of the box:
 - [PlatformIO CLI](https://docs.platformio.org/en/latest/core/installation/index.html)
 - Linux: `curl`, `bluetoothctl`, `busctl` (BlueZ Bluetooth stack)
 - macOS: `python3` (the installer sets up a venv with `bleak` and `httpx`)
-- Windows: Python 3.10+, PowerShell 5.1+
+- Windows: `python3` 3.11+, PowerShell 5.1+ (the installer sets up a venv with `bleak`, `httpx`, and `pystray`)
 - Claude Code with an active subscription
 
 ## macOS installation
@@ -137,18 +144,18 @@ The board env name is required. Run `./flash.sh` with no args to see the availab
 
 ### Pair the device
 
-After flashing, the device advertises as "Claudemeter". Pair it once:
+After flashing, the device advertises as "Clawdmeter". Pair it once:
 
 ```bash
 # Scan for the device
 bluetoothctl scan le
 
-# When "Claude Controller" appears, pair and trust it
+# When "Clawdmeter" appears, pair and trust it
 bluetoothctl pair F4:12:FA:C0:8F:E5    # use your device's MAC
 bluetoothctl trust F4:12:FA:C0:8F:E5
 ```
 
-The MAC address is shown on the Bluetooth screen — press the middle (PWR) button to cycle to it.
+To re-pair later, hold the power button for 3 seconds then release — the device clears its saved bond and re-advertises.
 
 ### Install the daemon
 
@@ -163,9 +170,73 @@ Check status: `systemctl --user status claude-usage-daemon`
 
 View logs: `journalctl --user -u claude-usage-daemon -f`
 
+## Windows installation
+
+Runs natively on Windows — no WSL required. A system-tray app polls your usage and pushes it over BLE, and starts automatically at login.
+
+### Prerequisites
+
+- **Native Windows** (not WSL).
+- **Python 3.11+** from [python.org](https://www.python.org/downloads/) — check *"Add python.exe to PATH"* during install.
+- **Claude Code** installed, with `claude login` completed. The token is read from `%USERPROFILE%\.claude\.credentials.json` (falling back to `%LOCALAPPDATA%\Claude\` then `%APPDATA%\Claude\`).
+- The repo on a **native Windows path** (e.g. `%USERPROFILE%\Clawdmeter`), **not** a `\\wsl$` share — the installer refuses a WSL path.
+
+### Flash the firmware
+
+```powershell
+pio run -d firmware -e waveshare_amoled_216 -t upload --upload-port COM5   # use your device's COM port
+```
+
+Run `pio run -d firmware` with no env to see the available board envs.
+
+### Pair the device
+
+The device is a bonded BLE HID keyboard, so pair it once: **Settings → Bluetooth & devices → Add device → Bluetooth**, then select "Claude Controller". Pairing is **required** — it enables the physical buttons and keeps a persistent connection (the device keeps showing your last-synced usage even after the daemon quits). To undo, use **Remove device** (this disables the buttons).
+
+### Install the daemon (recommended)
+
+From the repo root in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-windows.ps1
+```
+
+This creates a venv, installs `bleak`/`httpx`/`pystray`/`Pillow` from the in-repo requirements (no internet downloads), registers a per-user login-autostart entry (`HKCU\…\Run`, no admin needed), and launches the tray app headlessly (no console window).
+
+### Run manually instead (optional)
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1        # if blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned, then retry
+pip install -r daemon\requirements-windows.txt
+python daemon\claude_usage_daemon_windows.py        # runs in the foreground; Ctrl+C to stop
+```
+
+### Tray icon and menu
+
+The icon's corner bubble shows state — **green** Connected, **amber** Scanning, **red** Error — and hovering shows the status (`Connected · last update HH:MM`). A notification fires once when it enters Error (e.g. an expired token). Right-click for the menu:
+
+- **Status header** — live state + last sync time.
+- **Start at login** — toggle autostart on/off.
+- **Quit** — stops the daemon cleanly; leaves the Windows pairing intact (device keeps its last reading).
+
+### Logs and troubleshooting
+
+```powershell
+Get-Content $env:LOCALAPPDATA\Clawdmeter\daemon.log -Tail 30        # view logs
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f   # remove autostart
+```
+
+| Symptom | Fix |
+|---------|-----|
+| `Device not found` | Power on the device; make sure it's in range and paired. |
+| `token expired` toast / `API HTTP 401` | Re-run `claude login`, then restart the daemon. |
+| `Connection failed` | Toggle Windows Bluetooth off/on in Settings. |
+| `Warning: running under Linux/WSL` | Run from a native PowerShell window, not a WSL shell. |
+
 ## How it works
 
-1. The daemon reads your Claude Code OAuth token — from the macOS Keychain (service `Claude Code-credentials`) on macOS, or from `~/.claude/.credentials.json` on Linux/Windows. On Windows it also auto-refreshes the token via `claude doctor` when it expires (~12 h).
+1. The daemon reads your Claude Code OAuth token — from the macOS Keychain (service `Claude Code-credentials`) on macOS, or from `~/.claude/.credentials.json` on Linux/Windows (`%USERPROFILE%\.claude\.credentials.json`). On Windows it also auto-refreshes the token via `claude doctor` when it expires (~12 h).
 2. It calls `GET api.anthropic.com/api/oauth/usage` — no tokens consumed, no cost.
 3. The response gives the 5-hour utilization, next reset timestamp, and `extra_usage` with monthly credits used/limit/currency (e.g. `used_credits: 3554` = €35.54 of €150.00).
 4. The daemon connects to the ESP32 over BLE and writes a JSON payload to the GATT RX characteristic.
@@ -175,12 +246,12 @@ View logs: `journalctl --user -u claude-usage-daemon -f`
 
 ## Physical buttons
 
-The board has three side buttons. Left and right do the same thing on every screen; the middle button is screen-aware.
+The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles splash animations and, held for 3 seconds, triggers pairing mode.
 
 | Button           | GPIO         | Function                                                       |
 | ---------------- | ------------ | -------------------------------------------------------------- |
 | **Left**         | GPIO 0       | Hold to send Space (Claude Code voice-mode push-to-talk)       |
-| **Middle** (PWR) | AXP2101 PKEY | Cycle screens (Usage ↔ Bluetooth); on splash, cycle animations |
+| **Middle** (PWR) | AXP2101 PKEY | On splash: cycle animations. Hold 3s + release: pairing mode |
 | **Right**        | GPIO 18      | Press to send Shift+Tab (Claude Code mode toggle)              |
 
 Space and Shift+Tab go out as standard BLE HID keyboard reports, so they trigger in whatever window has focus on the paired host — not just Claude Code.
